@@ -19,7 +19,6 @@ int sym_count = 0;
 int dead_vars = 0;
 int constant_folds = 0;
 
-// Function to add or update symbol usage
 void mark_used(char *name) {
     for (int i = 0; i < sym_count; i++) {
         if (strcmp(sym_table[i].name, name) == 0) {
@@ -73,6 +72,12 @@ statement:
     | print_stmt
     | return_stmt
     | block
+    | function_def  /* Added function definition support */
+    ;
+
+/* Added rule to understand int main() { ... } */
+function_def:
+    TYPE ID '(' ')' block
     ;
 
 block:
@@ -106,7 +111,7 @@ return_stmt:
 
 expr:
     NUMBER { $$ = $1; }
-    | ID { mark_used($1); $$ = 0; /* simplified value tracking */ }
+    | ID { mark_used($1); $$ = 0; }
     | ID '[' expr ']' { mark_used($1); $$ = 0; }
     | expr '+' expr { $$ = $1 + $3; constant_folds++; printf("Optimizations Applied: Folded constant expression: %d + %d -> %d\n", $1, $3, $$); }
     | expr '-' expr { $$ = $1 - $3; constant_folds++; }
