@@ -1,13 +1,11 @@
 import streamlit as st
 import subprocess
 import os
+import platform
 
-# Set page layout to 'wide' to allow the side-by-side IDE look
+# Set page layout to 'wide'
 st.set_page_config(page_title="Dead Code Optimizer", layout="wide")
 
-# ==========================================
-# 1. WELCOME & ABOUT SECTION
-# ==========================================
 st.title("Welcome to the Dead Code Optimizer")
 
 st.markdown("""
@@ -17,26 +15,29 @@ It identifies and removes unnecessary statements or dead variables without alter
 Developed as an academic submission for the Computer Science and Engineering department at Daffodil International University (Batch 67), this tool utilizes Flex/Lex and Bison/Yacc for lexical and syntax analysis.
 """)
 
-st.write("---") # Adds a horizontal line for visual separation
+st.write("---")
 
-# ==========================================
-# 2. SESSION STATE FOR TOGGLING THE EDITOR
-# ==========================================
-# This remembers if the user has clicked the button to open the editor
 if 'show_editor' not in st.session_state:
     st.session_state.show_editor = False
 
-# ==========================================
-# 3. C PROGRAMME BLOCK BUTTON
-# ==========================================
-# When clicked, it toggles the 'show_editor' state between True and False
 if st.button("Open C Programme Block 💻"):
     st.session_state.show_editor = not st.session_state.show_editor
 
-# ==========================================
-# 4. SIDE-BY-SIDE EDITOR AND OUTPUT
-# ==========================================
-# If the user clicks the Run button in column 1, execute this in column 2
+if st.session_state.show_editor:
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("C Source Code")
+        default_code = "#include <stdio.h>\n\nint main() {\n    // Write your code here\n    \n    return 0;\n}"
+        user_code = st.text_area("Editor", value=default_code, height=450, label_visibility="collapsed")
+        
+        run_btn = st.button("Run Optimizer ►", type="primary")
+        
+    with col2:
+        st.subheader("Live Console Output")
+        output_placeholder = st.empty()
+        output_placeholder.info(">_ \n\nClick 'Run Optimizer' to start.")
+        
         if run_btn:
             if user_code.strip() == "":
                 output_placeholder.warning("Please enter some C code first.")
@@ -46,8 +47,6 @@ if st.button("Open C Programme Block 💻"):
                     file.write(user_code)
                 
                 # --- CLOUD COMPATIBILITY LOGIC ---
-                import platform
-                
                 # Check if we are on Windows or Linux
                 is_windows = platform.system() == "Windows"
                 exec_name = "optimizer.exe" if is_windows else "./optimizer"
