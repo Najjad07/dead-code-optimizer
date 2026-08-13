@@ -24,7 +24,7 @@ This project was developed as an academic submission for the **Compiler Design L
 
 ## 🌐 Live Demo
 The project is hosted live on Streamlit Cloud. 
-**Access the live application here:** [Replace this bracketed text with your actual Streamlit link!]
+**Access the live application here: https://dead-code-optimizer-5ul2eedtgeadkobx6dvw5a.streamlit.app/   
 
 ## 💻 Local Testing
 If you wish to run this tool locally on a Windows machine:
