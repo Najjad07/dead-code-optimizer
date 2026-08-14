@@ -35,6 +35,12 @@ comments and `/* ... */` block comments (even ones spanning multiple lines)
 are stripped. If a comment shares a line with real code (`int x = 5; // note`),
 only the comment part is removed and the code stays.
 
+**Variables are tracked per-function**, so `int i;` in one function and an
+unrelated `int i;` in another function are correctly treated as two separate
+variables — one can be flagged dead while the other, genuinely used one, is
+kept. Array and string initializers (`int arr[3] = {1, 2, 3};`,
+`char name[20] = "hello";`) are also supported now.
+
 **What counts as "dead code" here:**
 - **Dead variable** — declared but never read anywhere (its declaration line is removed).
 - **Dead store** — assigned a value that is never read before the program ends or the
