@@ -48,6 +48,78 @@ void exit_function(void) {
     if (scope_depth > 0) scope_depth--;
 }
 
+// ---- Reachability tracking (unreachable-code-after-return, and dead
+// branches from constant if/while/for conditions) ----
+#define MAX_BLOCK_DEPTH 64
+#define MAX_UNREACHABLE 2000
+
+struct BlockFrame {
+    int returned;           // has an unconditional return already occurred directly in this block?
+    int return_line;        // the line of that return
+    int saved_cond_depth;   // cond_depth to restore when this block closes
+};
+struct BlockFrame block_frames[MAX_BLOCK_DEPTH];
+int block_depth = 0;
+
+// >0 while parsing the brace-less single-statement body of an if/while/for/do
+// (i.e. a statement that only conditionally executes). A `return` seen while
+// this is >0 does NOT make later code in the enclosing block unreachable,
+// since it might not actually run.
+int cond_depth = 0;
+
+struct { int start; int end; } unreachable_ranges[MAX_UNREACHABLE];
+int unreachable_count = 0;
+
+void mark_unreachable(int start, int end) {
+    if (start > end) return;
+    if (unreachable_count < MAX_UNREACHABLE) {
+        unreachable_ranges[unreachable_count].start = start;
+        unreachable_ranges[unreachable_count].end = end;
+        unreachable_count++;
+    }
+}
+
+int is_unreachable_line(int line) {
+    for (int i = 0; i < unreachable_count; i++) {
+        if (line >= unreachable_ranges[i].start && line <= unreachable_ranges[i].end) return 1;
+    }
+    return 0;
+}
+
+void cond_enter(void) { cond_depth++; }
+void cond_exit(void) { if (cond_depth > 0) cond_depth--; }
+
+void push_block_frame(void) {
+    if (block_depth < MAX_BLOCK_DEPTH) {
+        block_frames[block_depth].returned = 0;
+        block_frames[block_depth].return_line = -1;
+        block_frames[block_depth].saved_cond_depth = cond_depth;
+        cond_depth = 0; // fresh block: statements in it run sequentially/unconditionally by default
+        block_depth++;
+    }
+}
+
+void pop_block_frame(int close_line) {
+    if (block_depth <= 0) return;
+    block_depth--;
+    struct BlockFrame *f = &block_frames[block_depth];
+    if (f->returned) {
+        mark_unreachable(f->return_line + 1, close_line - 1);
+    }
+    cond_depth = f->saved_cond_depth;
+}
+
+// Only an unconditional, direct-in-block return counts (cond_depth == 0);
+// a return nested inside a brace-less if/while/for body might not execute.
+void mark_frame_returned(int line) {
+    if (block_depth <= 0 || cond_depth != 0) return;
+    struct BlockFrame *f = &block_frames[block_depth - 1];
+    if (!f->returned) {
+        f->returned = 1;
+        f->return_line = line;
+    }
+}
+
 int dead_vars = 0;
 int constant_folds = 0;
 char fold_messages[8192] = "";
@@ -115,6 +187,7 @@ void mark_assigned(char *name, int line) {
     int ival;
     char* str;
     struct { int val; int is_const; } eval;
+    struct { int open; int close; } range;
 }
 
 %token <str> TYPE ID STRING_LITERAL
@@ -122,7 +195,8 @@ void mark_assigned(char *name, int line) {
 %token IF ELSE WHILE FOR DO BREAK CONTINUE RETURN PRINT
 %token EQ NE LE GE AND OR INC DEC PLUSEQ MINUSEQ MULEQ DIVEQ
 
-%type <eval> expr
+%type <eval> expr for_cond
+%type <range> statement block
 
 %right '?' ':'
 %left OR
@@ -140,16 +214,16 @@ program: statements ;
 statements: /* empty */ | statements statement ;
 
 statement:
-    declaration
-  | assignment_stmt
-  | control_struct
-  | jump_stmt
-  | print_stmt
-  | func_call_stmt
-  | return_stmt
-  | block
-  | function_def
-  | empty_stmt
+    declaration      { $$.open = 0; $$.close = 0; }
+  | assignment_stmt   { $$.open = 0; $$.close = 0; }
+  | control_struct    { $$.open = 0; $$.close = 0; }
+  | jump_stmt         { $$.open = 0; $$.close = 0; }
+  | print_stmt        { $$.open = 0; $$.close = 0; }
+  | func_call_stmt     { $$.open = 0; $$.close = 0; }
+  | return_stmt        { $$.open = 0; $$.close = 0; }
+  | block               { $$ = $1; }
+  | function_def         { $$.open = 0; $$.close = 0; }
+  | empty_stmt            { $$.open = 0; $$.close = 0; }
   ;
 
 empty_stmt: ';' ;
@@ -165,7 +239,15 @@ params: param | params ',' param ;
 // "dead code" elimination.
 param: TYPE ID ;
 
-block: '{' statements '}' ;
+block: '{' { push_block_frame(); $<ival>$ = yylineno; } statements '}'
+       {
+           int open_line = $<ival>2;
+           int close_line = yylineno;
+           pop_block_frame(close_line);
+           $$.open = open_line;
+           $$.close = close_line;
+       }
+     ;
 
 // ---- Declarations (supports multiple vars per line: int a, b = 5, c;) ----
 declaration: TYPE decl_list ';' ;
@@ -201,12 +283,47 @@ simple_assign:
   ;
 
 // ---- Control structures: if/else, while, do-while, for ----
+// Brace-less single-statement bodies are wrapped with cond_enter/cond_exit
+// so a `return` inside them is correctly treated as conditional (it might
+// not execute), not as making the rest of the enclosing block unreachable.
+//
+// Constant-condition dead-branch elimination only applies when the affected
+// branch is written as an explicit { } block: that lets us safely blank out
+// just its interior lines (never the header or the braces themselves, which
+// may be shared with other syntax like "} else {"), so the output always
+// stays valid, compilable C.
 control_struct:
-    IF '(' expr ')' statement ELSE statement
-  | IF '(' expr ')' statement
-  | WHILE '(' expr ')' statement
-  | DO statement WHILE '(' expr ')' ';'
-  | FOR '(' for_init ';' for_cond ';' for_incr ')' statement
+    IF { $<ival>$ = yylineno; } '(' expr ')' { cond_enter(); } statement { cond_exit(); }
+    ELSE { cond_enter(); } statement { cond_exit(); }
+      {
+          if ($4.is_const) {
+              if ($4.val != 0) {
+                  if ($11.open != 0) mark_unreachable($11.open + 1, $11.close - 1);
+              } else {
+                  if ($7.open != 0) mark_unreachable($7.open + 1, $7.close - 1);
+              }
+          }
+      }
+  | IF { $<ival>$ = yylineno; } '(' expr ')' { cond_enter(); } statement { cond_exit(); }
+      {
+          if ($4.is_const && $4.val == 0 && $7.open != 0) {
+              // No else clause, so the whole statement is safely removable.
+              mark_unreachable($<ival>2, $7.close);
+          }
+      }
+  | WHILE { $<ival>$ = yylineno; } '(' expr ')' { cond_enter(); } statement { cond_exit(); }
+      {
+          if ($4.is_const && $4.val == 0 && $7.open != 0) {
+              mark_unreachable($<ival>2, $7.close);
+          }
+      }
+  | DO { cond_enter(); } statement { cond_exit(); } WHILE '(' expr ')' ';'
+  | FOR { $<ival>$ = yylineno; } '(' for_init ';' for_cond ';' for_incr ')' { cond_enter(); } statement { cond_exit(); }
+      {
+          if ($6.is_const && $6.val == 0 && $11.open != 0) {
+              mark_unreachable($<ival>2, $11.close);
+          }
+      }
   ;
 
 for_init:
@@ -216,7 +333,10 @@ for_init:
   | /* empty */
   ;
 
-for_cond: expr | /* empty */ ;
+for_cond:
+    expr             { $$ = $1; }
+  | /* empty */       { $$.is_const = 0; $$.val = 1; } // no condition == always true, matches `for(;;)`
+  ;
 
 for_incr: simple_assign | /* empty */ ;
 
@@ -231,7 +351,7 @@ func_call_stmt: ID '(' opt_args ')' ';' ;
 opt_args: /* empty */ | args ;
 args: expr | args ',' expr ;
 
-return_stmt: RETURN expr ';' | RETURN ';' ;
+return_stmt: RETURN expr ';' { mark_frame_returned(yylineno); } | RETURN ';' { mark_frame_returned(yylineno); } ;
 
 expr:
     NUMBER                    { $$.val = $1; $$.is_const = 1; }
@@ -386,6 +506,7 @@ int main(int argc, char **argv) {
         if (sym_table[i].is_read == 0) dead_vars++;
     }
     printf("Dead Variables Removed      : %d\n", dead_vars);
+    printf("Unreachable Code Segments   : %d (dead branches / code after return)\n", unreachable_count);
     printf("----------------------------------------------------\n");
 
     if (strlen(fold_messages) > 0) {
@@ -396,6 +517,16 @@ int main(int argc, char **argv) {
         for (int i = 0; i < sym_count; i++) {
             if (sym_table[i].is_read == 0) {
                 printf("- Removed Variable '%s' (Unread Memory)\n", sym_table[i].name);
+            }
+        }
+    }
+    if (unreachable_count > 0) {
+        printf("\nUnreachable Code Eliminated :\n");
+        for (int i = 0; i < unreachable_count; i++) {
+            if (unreachable_ranges[i].start == unreachable_ranges[i].end) {
+                printf("- Line %d (unreachable / dead-condition branch)\n", unreachable_ranges[i].start);
+            } else {
+                printf("- Lines %d-%d (unreachable / dead-condition branch)\n", unreachable_ranges[i].start, unreachable_ranges[i].end);
             }
         }
     }
@@ -418,8 +549,9 @@ int main(int argc, char **argv) {
 
     while (fgets(line_buf, sizeof(line_buf), in)) {
         char cleaned[2100];
+        int line_is_dead = is_dead_line(current_line) || is_unreachable_line(current_line);
 
-        if (!is_dead_line(current_line)) {
+        if (!line_is_dead) {
             int line_had_content = line_has_content(line_buf);
             strip_comments_from_line(line_buf, cleaned, sizeof(cleaned), &in_block_comment);
             int cleaned_has_content = line_has_content(cleaned);
