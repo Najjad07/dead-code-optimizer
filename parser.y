@@ -8,11 +8,13 @@ extern int yylineno;
 extern FILE *yyin;
 void yyerror(const char *s);
 
-// Advanced Symbol Table
+// Advanced Symbol Table (Tracks Reads vs Writes)
 struct Symbol {
     char name[50];
-    int is_used;
-    int decl_line; // Tracks exactly where the code is
+    int is_read;         // 1 if the variable is actually used
+    int decl_line;       // Line where it was created
+    int assign_lines[20];// Tracks up to 20 different lines where it was assigned
+    int assign_count;
 } sym_table[100];
 int sym_count = 0;
 
@@ -20,23 +22,38 @@ int dead_vars = 0;
 int constant_folds = 0;
 char fold_messages[1000] = ""; 
 
-void mark_used(char *name) {
+// Register a new variable
+void declare_var(char *name, int line) {
+    for (int i = 0; i < sym_count; i++) {
+        if (strcmp(sym_table[i].name, name) == 0) return;
+    }
+    strcpy(sym_table[sym_count].name, name);
+    sym_table[sym_count].decl_line = line;
+    sym_table[sym_count].is_read = 0;
+    sym_table[sym_count].assign_count = 0;
+    sym_count++;
+}
+
+// Mark a variable as TRULY used (Read in an expression)
+void mark_read(char *name) {
     for (int i = 0; i < sym_count; i++) {
         if (strcmp(sym_table[i].name, name) == 0) {
-            sym_table[i].is_used = 1;
+            sym_table[i].is_read = 1;
             return;
         }
     }
 }
 
-void declare_var(char *name, int line) {
+// Track every line where a variable gets a new value
+void mark_assigned(char *name, int line) {
     for (int i = 0; i < sym_count; i++) {
-        if (strcmp(sym_table[i].name, name) == 0) return; // Prevent duplicates
+        if (strcmp(sym_table[i].name, name) == 0) {
+            if (sym_table[i].assign_count < 20) {
+                sym_table[i].assign_lines[sym_table[i].assign_count++] = line;
+            }
+            return;
+        }
     }
-    strcpy(sym_table[sym_count].name, name);
-    sym_table[sym_count].decl_line = line;
-    sym_table[sym_count].is_used = 0;
-    sym_count++;
 }
 %}
 
@@ -79,14 +96,17 @@ function_def: TYPE ID '(' ')' block ;
 
 block: '{' statements '}' | '{' '}' ;
 
+// Inline assignments now supported
 declaration:
     TYPE ID ';' { declare_var($2, yylineno); }
     | TYPE ID '[' expr ']' ';' { declare_var($2, yylineno); }
+    | TYPE ID '=' expr ';' { declare_var($2, yylineno); } 
     ;
 
+// Assignments tracked separately from declarations
 assignment:
-    ID '=' expr ';' { mark_used($1); }
-    | ID '[' expr ']' '=' expr ';' { mark_used($1); }
+    ID '=' expr ';' { mark_assigned($1, yylineno); }
+    | ID '[' expr ']' '=' expr ';' { mark_assigned($1, yylineno); }
     ;
 
 control_struct:
@@ -108,9 +128,9 @@ return_stmt: RETURN expr ';' | RETURN ';' ;
 
 expr:
     NUMBER { $$ = $1; }
-    | ID { mark_used($1); $$ = 0; }
-    | ID '[' expr ']' { mark_used($1); $$ = 0; }
-    | '(' expr ')' { $$ = $2; } /* Added parentheses support! */
+    | ID { mark_read($1); $$ = 0; } // Variable is READ here
+    | ID '[' expr ']' { mark_read($1); $$ = 0; }
+    | '(' expr ')' { $$ = $2; } 
     | expr '+' expr { $$ = $1 + $3; constant_folds++; char buf[100]; sprintf(buf, "- Folded: %d + %d -> %d\n", $1, $3, $$); strcat(fold_messages, buf); }
     | expr '-' expr { $$ = $1 - $3; constant_folds++; char buf[100]; sprintf(buf, "- Folded: %d - %d -> %d\n", $1, $3, $$); strcat(fold_messages, buf); }
     | expr '*' expr { $$ = $1 * $3; constant_folds++; char buf[100]; sprintf(buf, "- Folded: %d * %d -> %d\n", $1, $3, $$); strcat(fold_messages, buf); }
@@ -121,13 +141,19 @@ expr:
 
 %%
 
-void yyerror(const char *s) { /* Silently handle dangling-else for robust lab use */ }
+void yyerror(const char *s) { }
 
-// Helper function to check if a line of code should be deleted
+// The ultimate line deleter
 int is_dead_line(int line) {
     for (int i = 0; i < sym_count; i++) {
-        if (sym_table[i].decl_line == line && sym_table[i].is_used == 0) {
-            return 1;
+        // If a variable was NEVER read
+        if (sym_table[i].is_read == 0) {
+            // Delete the line it was declared on
+            if (sym_table[i].decl_line == line) return 1;
+            // Delete EVERY line where it was assigned a value
+            for (int j = 0; j < sym_table[i].assign_count; j++) {
+                if (sym_table[i].assign_lines[j] == line) return 1;
+            }
         }
     }
     return 0;
@@ -140,7 +166,6 @@ int main(int argc, char **argv) {
     yyparse();
     if (yyin) fclose(yyin);
 
-    // 1. PRINT SUMMARY REPORT
     printf("====================================================\n");
     printf("OPTIMIZATION SUMMARY REPORT\n");
     printf("====================================================\n");
@@ -149,27 +174,25 @@ int main(int argc, char **argv) {
     printf("Constant Expressions Folded : %d\n", constant_folds);
     
     for (int i = 0; i < sym_count; i++) {
-        if (sym_table[i].is_used == 0) dead_vars++;
+        if (sym_table[i].is_read == 0) dead_vars++;
     }
     printf("Dead Variables Removed      : %d\n", dead_vars);
     printf("----------------------------------------------------\n");
     
-    // Print Exactly what was optimized
     if (strlen(fold_messages) > 0) {
         printf("Optimizations Applied:\n%s", fold_messages);
     }
     if (dead_vars > 0) {
-        printf("\nDead Code Eliminated :\n");
+        printf("\nDead Code Eliminated (A to Z):\n");
         for (int i = 0; i < sym_count; i++) {
-            if (sym_table[i].is_used == 0) {
-                printf("- Removed Variable '%s' (Found at line %d)\n", sym_table[i].name, sym_table[i].decl_line);
+            if (sym_table[i].is_read == 0) {
+                printf("- Removed Variable '%s' (Unread Memory)\n", sym_table[i].name);
             }
         }
     }
     
-    // 2. PRINT OPTIMIZED SOURCE CODE
     printf("\n====================================================\n");
-    printf("OPTIMIZED C SOURCE CODE (output_optimized.c)\n");
+    printf("OPTIMIZED C SOURCE CODE\n");
     printf("====================================================\n");
     
     FILE *in = fopen(argv[1], "r");
@@ -177,8 +200,6 @@ int main(int argc, char **argv) {
     char line_buf[1024];
     int current_line = 1;
     
-    // Read the original file, line by line. 
-    // If the line contains a dead variable, skip it!
     while (fgets(line_buf, sizeof(line_buf), in)) {
         if (!is_dead_line(current_line)) {
             printf("%s", line_buf);
