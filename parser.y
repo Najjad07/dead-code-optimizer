@@ -141,7 +141,12 @@ expr:
 
 %%
 
-void yyerror(const char *s) { }
+int has_error = 0;
+
+void yyerror(const char *s) { 
+    fprintf(stderr, "Syntax Error near line %d: %s\n", yylineno, s);
+    has_error = 1;
+}
 
 // The ultimate line deleter
 int is_dead_line(int line) {
@@ -163,8 +168,17 @@ int main(int argc, char **argv) {
     if (argc > 1) {
         yyin = fopen(argv[1], "r");
     }
-    yyparse();
+   yyparse();
     if (yyin) fclose(yyin);
+
+    // --- NEW: STOP IF SYNTAX IS BROKEN ---
+    if (has_error) {
+        return 1; 
+    }
+    // -------------------------------------
+
+    printf("====================================================\n");
+    printf("OPTIMIZATION SUMMARY REPORT\n");
 
     printf("====================================================\n");
     printf("OPTIMIZATION SUMMARY REPORT\n");
