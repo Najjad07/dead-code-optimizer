@@ -9,19 +9,44 @@ extern int yylineno;
 extern FILE *yyin;
 void yyerror(const char *s);
 
-#define MAX_SYMS 500
-#define MAX_ASSIGNS 200
+#define MAX_SYMS 1000
+#define MAX_ASSIGNS 300
 #define NAME_LEN 128
+#define MAX_SCOPE_DEPTH 32
 
-// Symbol Table (Tracks Reads vs Writes)
+// Symbol Table (Tracks Reads vs Writes). Each symbol is tagged with the
+// function it was declared in ("" means declared at global scope), so two
+// different functions can each safely have their own unrelated "int i;"
+// without polluting each other's dead-code analysis.
 struct Symbol {
     char name[NAME_LEN];
+    char scope[NAME_LEN];            // owning function name, or "" for global
     int is_read;                     // 1 if the variable is ever read
     int decl_line;                   // Line where it was declared
     int assign_lines[MAX_ASSIGNS];   // Every line where it was (re)assigned
     int assign_count;
 } sym_table[MAX_SYMS];
 int sym_count = 0;
+
+// Tiny scope stack: pushed on entering a function body, popped on leaving it.
+char scope_stack[MAX_SCOPE_DEPTH][NAME_LEN];
+int scope_depth = 0;
+
+const char *current_scope(void) {
+    return scope_depth == 0 ? "" : scope_stack[scope_depth - 1];
+}
+
+void enter_function(const char *name) {
+    if (scope_depth < MAX_SCOPE_DEPTH) {
+        strncpy(scope_stack[scope_depth], name ? name : "", NAME_LEN - 1);
+        scope_stack[scope_depth][NAME_LEN - 1] = '\0';
+        scope_depth++;
+    }
+}
+
+void exit_function(void) {
+    if (scope_depth > 0) scope_depth--;
+}
 
 int dead_vars = 0;
 int constant_folds = 0;
@@ -36,42 +61,52 @@ void add_fold_message(const char *msg) {
     }
 }
 
-// Register a new variable (ignored if the table is full or it already exists)
+// Register a new variable in the current scope (ignored if the table is
+// full or this exact name+scope was already declared).
 void declare_var(char *name, int line) {
     if (!name) return;
+    const char *sc = current_scope();
     for (int i = 0; i < sym_count; i++) {
-        if (strcmp(sym_table[i].name, name) == 0) return;
+        if (strcmp(sym_table[i].name, name) == 0 && strcmp(sym_table[i].scope, sc) == 0) return;
     }
     if (sym_count >= MAX_SYMS) return;
     strncpy(sym_table[sym_count].name, name, NAME_LEN - 1);
     sym_table[sym_count].name[NAME_LEN - 1] = '\0';
+    strncpy(sym_table[sym_count].scope, sc, NAME_LEN - 1);
+    sym_table[sym_count].scope[NAME_LEN - 1] = '\0';
     sym_table[sym_count].decl_line = line;
     sym_table[sym_count].is_read = 0;
     sym_table[sym_count].assign_count = 0;
     sym_count++;
 }
 
+// Finds the symbol table index best matching `name` from the current scope:
+// prefer an exact scope match (a local of the current function), otherwise
+// fall back to a global (scope == "") declaration. Returns -1 if none.
+int resolve_symbol(const char *name) {
+    const char *sc = current_scope();
+    int global_idx = -1;
+    for (int i = 0; i < sym_count; i++) {
+        if (strcmp(sym_table[i].name, name) != 0) continue;
+        if (strcmp(sym_table[i].scope, sc) == 0) return i;
+        if (sym_table[i].scope[0] == '\0') global_idx = i;
+    }
+    return global_idx;
+}
+
 // Mark a variable as genuinely used (read in an expression / condition / print / call)
 void mark_read(char *name) {
     if (!name) return;
-    for (int i = 0; i < sym_count; i++) {
-        if (strcmp(sym_table[i].name, name) == 0) {
-            sym_table[i].is_read = 1;
-            return;
-        }
-    }
+    int idx = resolve_symbol(name);
+    if (idx >= 0) sym_table[idx].is_read = 1;
 }
 
 // Track every line where a variable gets a new value
 void mark_assigned(char *name, int line) {
     if (!name) return;
-    for (int i = 0; i < sym_count; i++) {
-        if (strcmp(sym_table[i].name, name) == 0) {
-            if (sym_table[i].assign_count < MAX_ASSIGNS) {
-                sym_table[i].assign_lines[sym_table[i].assign_count++] = line;
-            }
-            return;
-        }
+    int idx = resolve_symbol(name);
+    if (idx >= 0 && sym_table[idx].assign_count < MAX_ASSIGNS) {
+        sym_table[idx].assign_lines[sym_table[idx].assign_count++] = line;
     }
 }
 %}
@@ -121,7 +156,7 @@ empty_stmt: ';' ;
 
 jump_stmt: BREAK ';' | CONTINUE ';' ;
 
-function_def: TYPE ID '(' param_list ')' block ;
+function_def: TYPE ID '(' param_list ')' { enter_function($2); } block { exit_function(); } ;
 
 param_list: /* empty */ | params ;
 params: param | params ',' param ;
@@ -138,10 +173,16 @@ declaration: TYPE decl_list ';' ;
 decl_list: decl_item | decl_list ',' decl_item ;
 
 decl_item:
-    ID                       { declare_var($1, yylineno); }
-  | ID '[' expr ']'          { declare_var($1, yylineno); }
-  | ID '=' expr              { declare_var($1, yylineno); }
+    ID                              { declare_var($1, yylineno); }
+  | ID '[' expr ']'                 { declare_var($1, yylineno); }
+  | ID '=' expr                     { declare_var($1, yylineno); }
+  | ID '=' STRING_LITERAL           { declare_var($1, yylineno); }
+  | ID '[' expr ']' '=' STRING_LITERAL          { declare_var($1, yylineno); }
+  | ID '[' expr ']' '=' '{' array_init '}'      { declare_var($1, yylineno); }
+  | ID '[' ']' '=' '{' array_init '}'           { declare_var($1, yylineno); }
   ;
+
+array_init: expr | array_init ',' expr ;
 
 // ---- Assignments (=, +=, -=, *=, /=, ++, --) ----
 assignment_stmt: simple_assign ';' ;
