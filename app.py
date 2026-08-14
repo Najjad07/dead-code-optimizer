@@ -41,6 +41,18 @@ variables — one can be flagged dead while the other, genuinely used one, is
 kept. Array and string initializers (`int arr[3] = {1, 2, 3};`,
 `char name[20] = "hello";`) are also supported now.
 
+**Unreachable code after `return` is removed.** Any statements that come
+after an unconditional `return` inside the same `{ }` block — and can never
+execute — are stripped from the output.
+
+**Dead branches from constant conditions are removed.** `if (0) { ... }`,
+`if (1) { ... } else { ... }`, and `while (0) { ... }` are evaluated at
+compile time; the branch/loop body that can never run is stripped. This only
+applies when that branch is written as an explicit `{ }` block — a brace-less
+single-statement body (`if (0) doThing();`) is left alone, since safely
+deleting it without risking invalid C (e.g. a dangling `else`) isn't always
+possible with this tool's line-based approach.
+
 **What counts as "dead code" here:**
 - **Dead variable** — declared but never read anywhere (its declaration line is removed).
 - **Dead store** — assigned a value that is never read before the program ends or the
@@ -50,10 +62,14 @@ kept. Array and string initializers (`int arr[3] = {1, 2, 3};`,
   evaluated at compile time and reported, though the source line itself is left intact
   since it isn't *dead*, just simplifiable.
 
-**Known limitation:** removal is based on "was this variable read anywhere in the file
-at all," not full control-flow liveness. So `x = 5; x = 10; printf(x);` will **not**
-flag the first `x = 5;` as dead, because `x` is read later. Unreachable code after a
-`return` and constant-condition branches (`if (0) { ... }`) are also not pruned yet.
+**Known limitation:** removal is based on "was this variable read anywhere in
+its scope at all," not full control-flow liveness. So `x = 5; x = 10; printf(x);`
+will **not** flag the first `x = 5;` as dead, because `x` is read later
+(true dead-*store* detection, as opposed to dead-*variable* detection, isn't
+implemented — it would need real per-line liveness analysis). Also, a variable
+read only inside a branch that later gets removed as dead-condition code is
+still counted as "read" during analysis, so its declaration won't be flagged
+dead even after that branch disappears — a minor, documented imprecision.
 """)
 
 st.write("---")
@@ -122,8 +138,12 @@ if st.session_state.show_editor:
             "    for (int i = 0; i < active_var; i++) {\n"
             "        total += i;\n"
             "    }\n\n"
+            "    if (0) {\n"
+            "        printf(\"this branch is impossible\");\n"
+            "    }\n\n"
             "    printf(\"%d\", total);\n"
             "    return 0;\n"
+            "    printf(\"this line can never run\");\n"
             "}"
         )
         user_code = st.text_area("Editor", value=default_code, height=350, label_visibility="collapsed")
