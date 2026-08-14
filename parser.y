@@ -183,7 +183,7 @@ int main(int argc, char **argv) {
         printf("Optimizations Applied:\n%s", fold_messages);
     }
     if (dead_vars > 0) {
-        printf("\nDead Code Eliminated (A to Z):\n");
+        printf("\nDead Code Eliminated :\n");
         for (int i = 0; i < sym_count; i++) {
             if (sym_table[i].is_read == 0) {
                 printf("- Removed Variable '%s' (Unread Memory)\n", sym_table[i].name);
