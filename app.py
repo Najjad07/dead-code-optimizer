@@ -41,11 +41,9 @@ variables — one can be flagged dead while the other, genuinely used one, is
 kept. Array and string initializers (`int arr[3] = {1, 2, 3};`,
 `char name[20] = "hello";`) are also supported now.
 
-**Unreachable code after `return`, `break`, or `continue` is removed.** Any
-statements that come after one of these inside the same `{ }` block — and
-can never execute as a result — are stripped from the output. A `break`
-buried inside a brace-less, still-conditional `if` doesn't wrongly poison
-the rest of the loop body, since only an *unconditional* one counts.
+**Unreachable code after `return` is removed.** Any statements that come
+after an unconditional `return` inside the same `{ }` block — and can never
+execute — are stripped from the output.
 
 **Dead branches from constant conditions are removed.** `if (0) { ... }`,
 `if (1) { ... } else { ... }`, and `while (0) { ... }` are evaluated at
@@ -55,42 +53,23 @@ single-statement body (`if (0) doThing();`) is left alone, since safely
 deleting it without risking invalid C (e.g. a dangling `else`) isn't always
 possible with this tool's line-based approach.
 
-**Unused functions are removed entirely.** A function that's defined but
-never called anywhere (as its own statement, e.g. `helper();`) has its whole
-definition stripped from the output. `main` is always kept, since the C
-runtime calls it implicitly even though nothing in your source does.
-
-**Dead stores are now detected**, not just fully-unused variables:
-`x = 5; x = 10; printf(x);` will flag the `x = 5;` line, since that value is
-overwritten before it's ever read. This is based on source order, not true
-control-flow analysis (see the limitation note below), and doesn't apply to
-array-element writes (`arr[i] = x;`), since this tool tracks a whole array as
-one symbol and can't safely tell whether two different indices alias.
-
 **What counts as "dead code" here:**
 - **Dead variable** — declared but never read anywhere (its declaration line is removed).
-- **Dead store** — assigned a value that gets overwritten by a later assignment
-  before ever being read.
-- **Unreachable code** — statements after an unconditional `return`/`break`/`continue`,
-  or inside a branch a constant condition proves can never run.
-- **Unused function** — defined but never called.
+- **Dead store** — assigned a value that is never read before the program ends or the
+  variable is reassigned (only whole never-read variables are removed in this version —
+  see note below).
 - **Constant folding** — an expression made only of literals (e.g. `10 + 20`) is
   evaluated at compile time and reported, though the source line itself is left intact
   since it isn't *dead*, just simplifiable.
 
-**Known limitations:**
-- Dead-store and reachability analysis follow *source order*, not true
-  control-flow order — a write inside a loop or branch can be misjudged
-  relative to code that comes textually after it, since the tool doesn't model
-  how many times a loop runs or which branch is taken at runtime.
-- A function call is only recognized when written as its own statement
-  (`helper();`); a call used inside an expression isn't supported at all (see
-  above), so it obviously can't mark that function as used either.
-- A variable read only inside a branch that later gets removed as
-  dead-condition code is still counted as "read" during analysis, so its
-  declaration won't be flagged dead even after that branch disappears — a
-  minor, documented imprecision.
-- No block-level variable shadowing (only function-level scoping).
+**Known limitation:** removal is based on "was this variable read anywhere in
+its scope at all," not full control-flow liveness. So `x = 5; x = 10; printf(x);`
+will **not** flag the first `x = 5;` as dead, because `x` is read later
+(true dead-*store* detection, as opposed to dead-*variable* detection, isn't
+implemented — it would need real per-line liveness analysis). Also, a variable
+read only inside a branch that later gets removed as dead-condition code is
+still counted as "read" during analysis, so its declaration won't be flagged
+dead even after that branch disappears — a minor, documented imprecision.
 """)
 
 st.write("---")
@@ -151,21 +130,12 @@ if st.session_state.show_editor:
             "int add(int a, int b) {\n"
             "    return a + b;\n"
             "}\n\n"
-            "void deadFunction() {\n"
-            "    printf(\"This function is never called.\");\n"
-            "}\n\n"
             "int main() {\n"
             "    int active_var = 10;\n"
             "    int dead_var;\n"
             "    int sum = 10 + 20;\n"
             "    int total = 0;\n\n"
-            "    total = 5;\n"
-            "    total = 0;\n\n"
             "    for (int i = 0; i < active_var; i++) {\n"
-            "        if (i == 3) {\n"
-            "            break;\n"
-            "            printf(\"Dead code inside loop.\");\n"
-            "        }\n"
             "        total += i;\n"
             "    }\n\n"
             "    if (0) {\n"
