@@ -10,7 +10,7 @@ extern FILE *yyin;
 void yyerror(const char *s);
 
 #define MAX_SYMS 1000
-#define MAX_ASSIGNS 300
+#define MAX_EVENTS 500
 #define NAME_LEN 128
 #define MAX_SCOPE_DEPTH 32
 
@@ -18,13 +18,20 @@ void yyerror(const char *s);
 // function it was declared in ("" means declared at global scope), so two
 // different functions can each safely have their own unrelated "int i;"
 // without polluting each other's dead-code analysis.
+//
+// Every read and write is also logged, in source order, as an "event". This
+// powers dead-store detection: a write is dead if it's overwritten by
+// another write before ever being read. Array-element writes (arr[i] = x)
+// are logged but marked ineligible for this check, since this tool tracks
+// whole arrays as one symbol and can't safely tell whether two different
+// indices alias each other.
 struct Symbol {
     char name[NAME_LEN];
     char scope[NAME_LEN];            // owning function name, or "" for global
-    int is_read;                     // 1 if the variable is ever read
+    int is_read;                     // 1 if the variable is ever read anywhere
     int decl_line;                   // Line where it was declared
-    int assign_lines[MAX_ASSIGNS];   // Every line where it was (re)assigned
-    int assign_count;
+    struct { int line; int is_write; int eligible; } events[MAX_EVENTS];
+    int event_count;
 } sym_table[MAX_SYMS];
 int sym_count = 0;
 
@@ -48,23 +55,54 @@ void exit_function(void) {
     if (scope_depth > 0) scope_depth--;
 }
 
-// ---- Reachability tracking (unreachable-code-after-return, and dead
-// branches from constant if/while/for conditions) ----
+// ---- Function table (unused-function detection) ----
+#define MAX_FUNCS 200
+
+struct FuncInfo {
+    char name[NAME_LEN];
+    int start_line;   // line of the return-type keyword
+    int end_line;      // line of the closing '}'
+    int is_called;
+} func_table[MAX_FUNCS];
+int func_count = 0;
+
+void register_function(const char *name, int start_line, int end_line) {
+    if (!name || func_count >= MAX_FUNCS) return;
+    strncpy(func_table[func_count].name, name, NAME_LEN - 1);
+    func_table[func_count].name[NAME_LEN - 1] = '\0';
+    func_table[func_count].start_line = start_line;
+    func_table[func_count].end_line = end_line;
+    func_table[func_count].is_called = 0;
+    func_count++;
+}
+
+void mark_function_called(const char *name) {
+    if (!name) return;
+    for (int i = 0; i < func_count; i++) {
+        if (strcmp(func_table[i].name, name) == 0) {
+            func_table[i].is_called = 1;
+            return;
+        }
+    }
+}
+
+// ---- Reachability tracking (unreachable-code-after-return/break/continue,
+// and dead branches from constant if/while/for conditions) ----
 #define MAX_BLOCK_DEPTH 64
 #define MAX_UNREACHABLE 2000
 
 struct BlockFrame {
-    int returned;           // has an unconditional return already occurred directly in this block?
-    int return_line;        // the line of that return
+    int terminated;         // has an unconditional return/break/continue already occurred directly in this block?
+    int terminated_line;    // the line of that statement
     int saved_cond_depth;   // cond_depth to restore when this block closes
 };
 struct BlockFrame block_frames[MAX_BLOCK_DEPTH];
 int block_depth = 0;
 
 // >0 while parsing the brace-less single-statement body of an if/while/for/do
-// (i.e. a statement that only conditionally executes). A `return` seen while
-// this is >0 does NOT make later code in the enclosing block unreachable,
-// since it might not actually run.
+// (i.e. a statement that only conditionally executes). A `return`/`break`/
+// `continue` seen while this is >0 does NOT make later code in the enclosing
+// block unreachable, since it might not actually run.
 int cond_depth = 0;
 
 struct { int start; int end; } unreachable_ranges[MAX_UNREACHABLE];
@@ -91,8 +129,8 @@ void cond_exit(void) { if (cond_depth > 0) cond_depth--; }
 
 void push_block_frame(void) {
     if (block_depth < MAX_BLOCK_DEPTH) {
-        block_frames[block_depth].returned = 0;
-        block_frames[block_depth].return_line = -1;
+        block_frames[block_depth].terminated = 0;
+        block_frames[block_depth].terminated_line = -1;
         block_frames[block_depth].saved_cond_depth = cond_depth;
         cond_depth = 0; // fresh block: statements in it run sequentially/unconditionally by default
         block_depth++;
@@ -103,20 +141,23 @@ void pop_block_frame(int close_line) {
     if (block_depth <= 0) return;
     block_depth--;
     struct BlockFrame *f = &block_frames[block_depth];
-    if (f->returned) {
-        mark_unreachable(f->return_line + 1, close_line - 1);
+    if (f->terminated) {
+        mark_unreachable(f->terminated_line + 1, close_line - 1);
     }
     cond_depth = f->saved_cond_depth;
 }
 
-// Only an unconditional, direct-in-block return counts (cond_depth == 0);
-// a return nested inside a brace-less if/while/for body might not execute.
-void mark_frame_returned(int line) {
+// Only an unconditional, direct-in-block return/break/continue counts
+// (cond_depth == 0); one nested inside a brace-less if/while/for body might
+// not execute. All three have the same effect on straight-line reachability
+// within the immediately enclosing block: nothing after them in that block
+// runs.
+void mark_frame_terminated(int line) {
     if (block_depth <= 0 || cond_depth != 0) return;
     struct BlockFrame *f = &block_frames[block_depth - 1];
-    if (!f->returned) {
-        f->returned = 1;
-        f->return_line = line;
+    if (!f->terminated) {
+        f->terminated = 1;
+        f->terminated_line = line;
     }
 }
 
@@ -148,7 +189,7 @@ void declare_var(char *name, int line) {
     sym_table[sym_count].scope[NAME_LEN - 1] = '\0';
     sym_table[sym_count].decl_line = line;
     sym_table[sym_count].is_read = 0;
-    sym_table[sym_count].assign_count = 0;
+    sym_table[sym_count].event_count = 0;
     sym_count++;
 }
 
@@ -166,20 +207,39 @@ int resolve_symbol(const char *name) {
     return global_idx;
 }
 
+void append_event(int idx, int line, int is_write, int eligible) {
+    if (idx < 0) return;
+    if (sym_table[idx].event_count < MAX_EVENTS) {
+        int e = sym_table[idx].event_count++;
+        sym_table[idx].events[e].line = line;
+        sym_table[idx].events[e].is_write = is_write;
+        sym_table[idx].events[e].eligible = eligible;
+    }
+}
+
 // Mark a variable as genuinely used (read in an expression / condition / print / call)
 void mark_read(char *name) {
     if (!name) return;
     int idx = resolve_symbol(name);
-    if (idx >= 0) sym_table[idx].is_read = 1;
+    if (idx < 0) return;
+    sym_table[idx].is_read = 1;
+    append_event(idx, yylineno, 0, 1);
 }
 
-// Track every line where a variable gets a new value
+// Track every line where a scalar variable gets a new value (eligible for
+// dead-store analysis).
 void mark_assigned(char *name, int line) {
     if (!name) return;
     int idx = resolve_symbol(name);
-    if (idx >= 0 && sym_table[idx].assign_count < MAX_ASSIGNS) {
-        sym_table[idx].assign_lines[sym_table[idx].assign_count++] = line;
-    }
+    append_event(idx, line, 1, 1);
+}
+
+// Same, but for an array-element write (arr[i] = x); excluded from dead-store
+// analysis since different indices don't actually overwrite each other.
+void mark_assigned_array(char *name, int line) {
+    if (!name) return;
+    int idx = resolve_symbol(name);
+    append_event(idx, line, 1, 0);
 }
 %}
 
@@ -228,9 +288,9 @@ statement:
 
 empty_stmt: ';' ;
 
-jump_stmt: BREAK ';' | CONTINUE ';' ;
+jump_stmt: BREAK ';' { mark_frame_terminated(yylineno); } | CONTINUE ';' { mark_frame_terminated(yylineno); } ;
 
-function_def: TYPE ID '(' param_list ')' { enter_function($2); } block { exit_function(); } ;
+function_def: TYPE { $<ival>$ = yylineno; } ID '(' param_list ')' { enter_function($3); } block { exit_function(); register_function($3, $<ival>2, $8.close); } ;
 
 param_list: /* empty */ | params ;
 params: param | params ',' param ;
@@ -271,7 +331,7 @@ assignment_stmt: simple_assign ';' ;
 
 simple_assign:
     ID '=' expr                  { mark_assigned($1, yylineno); }
-  | ID '[' expr ']' '=' expr     { mark_assigned($1, yylineno); }
+  | ID '[' expr ']' '=' expr     { mark_assigned_array($1, yylineno); }
   | ID PLUSEQ expr                { mark_read($1); mark_assigned($1, yylineno); }
   | ID MINUSEQ expr               { mark_read($1); mark_assigned($1, yylineno); }
   | ID MULEQ expr                 { mark_read($1); mark_assigned($1, yylineno); }
@@ -346,12 +406,12 @@ print_stmt:
   | PRINT '(' args ')' ';'
   ;
 
-func_call_stmt: ID '(' opt_args ')' ';' ;
+func_call_stmt: ID '(' opt_args ')' ';' { mark_function_called($1); } ;
 
 opt_args: /* empty */ | args ;
 args: expr | args ',' expr ;
 
-return_stmt: RETURN expr ';' { mark_frame_returned(yylineno); } | RETURN ';' { mark_frame_returned(yylineno); } ;
+return_stmt: RETURN expr ';' { mark_frame_terminated(yylineno); } | RETURN ';' { mark_frame_terminated(yylineno); } ;
 
 expr:
     NUMBER                    { $$.val = $1; $$.is_const = 1; }
@@ -423,10 +483,51 @@ int is_dead_line(int line) {
     for (int i = 0; i < sym_count; i++) {
         if (sym_table[i].is_read == 0) {
             if (sym_table[i].decl_line == line) return 1;
-            for (int j = 0; j < sym_table[i].assign_count; j++) {
-                if (sym_table[i].assign_lines[j] == line) return 1;
+            for (int j = 0; j < sym_table[i].event_count; j++) {
+                if (sym_table[i].events[j].is_write && sym_table[i].events[j].line == line) return 1;
             }
         }
+    }
+    return 0;
+}
+
+// ---- Dead-store detection ----
+// A write is a "dead store" if it gets overwritten by another write to the
+// same variable before that value is ever read. This walks each symbol's
+// event list (source order) once. Only runs for variables that ARE read
+// somewhere overall (sym_table[i].is_read == 1) - a variable that's never
+// read at all is already fully removed via is_dead_line, and re-flagging its
+// writes here would just be redundant. Array-element writes are skipped,
+// since this tool can't tell whether two different indices alias.
+//
+// Known limitation: this is source-order, not true control-flow order, so
+// it can misjudge writes inside loops/branches relative to code after them.
+// It's a heuristic, like the rest of this tool's analyses.
+#define MAX_DEAD_STORES 1000
+int dead_store_lines[MAX_DEAD_STORES];
+int dead_store_count = 0;
+
+void compute_dead_stores(void) {
+    for (int i = 0; i < sym_count; i++) {
+        if (!sym_table[i].is_read) continue;
+        for (int j = 0; j < sym_table[i].event_count; j++) {
+            if (!sym_table[i].events[j].is_write || !sym_table[i].events[j].eligible) continue;
+            int dead = 0;
+            for (int k = j + 1; k < sym_table[i].event_count; k++) {
+                if (!sym_table[i].events[k].eligible) continue; // array writes are invisible to this check
+                if (sym_table[i].events[k].is_write) { dead = 1; } else { dead = 0; }
+                break;
+            }
+            if (dead && dead_store_count < MAX_DEAD_STORES) {
+                dead_store_lines[dead_store_count++] = sym_table[i].events[j].line;
+            }
+        }
+    }
+}
+
+int is_dead_store_line(int line) {
+    for (int i = 0; i < dead_store_count; i++) {
+        if (dead_store_lines[i] == line) return 1;
     }
     return 0;
 }
@@ -495,6 +596,18 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    compute_dead_stores();
+
+    // Any function that's never called (except main, which the C runtime
+    // calls implicitly) is dead code: blank out its entire definition.
+    int dead_func_count = 0;
+    for (int i = 0; i < func_count; i++) {
+        if (!func_table[i].is_called && strcmp(func_table[i].name, "main") != 0) {
+            mark_unreachable(func_table[i].start_line, func_table[i].end_line);
+            dead_func_count++;
+        }
+    }
+
     printf("====================================================\n");
     printf("OPTIMIZATION SUMMARY REPORT\n");
     printf("====================================================\n");
@@ -506,7 +619,9 @@ int main(int argc, char **argv) {
         if (sym_table[i].is_read == 0) dead_vars++;
     }
     printf("Dead Variables Removed      : %d\n", dead_vars);
-    printf("Unreachable Code Segments   : %d (dead branches / code after return)\n", unreachable_count);
+    printf("Dead Stores Removed         : %d (value overwritten before use)\n", dead_store_count);
+    printf("Dead Functions Removed      : %d (never called)\n", dead_func_count);
+    printf("Unreachable Code Segments   : %d (dead branches / code after return, break, continue)\n", unreachable_count);
     printf("----------------------------------------------------\n");
 
     if (strlen(fold_messages) > 0) {
@@ -517,6 +632,20 @@ int main(int argc, char **argv) {
         for (int i = 0; i < sym_count; i++) {
             if (sym_table[i].is_read == 0) {
                 printf("- Removed Variable '%s' (Unread Memory)\n", sym_table[i].name);
+            }
+        }
+    }
+    if (dead_store_count > 0) {
+        printf("\nDead Stores Eliminated :\n");
+        for (int i = 0; i < dead_store_count; i++) {
+            printf("- Line %d (value overwritten before being read)\n", dead_store_lines[i]);
+        }
+    }
+    if (dead_func_count > 0) {
+        printf("\nDead Functions Eliminated :\n");
+        for (int i = 0; i < func_count; i++) {
+            if (!func_table[i].is_called && strcmp(func_table[i].name, "main") != 0) {
+                printf("- Removed Function '%s' (Never Called)\n", func_table[i].name);
             }
         }
     }
@@ -549,7 +678,7 @@ int main(int argc, char **argv) {
 
     while (fgets(line_buf, sizeof(line_buf), in)) {
         char cleaned[2100];
-        int line_is_dead = is_dead_line(current_line) || is_unreachable_line(current_line);
+        int line_is_dead = is_dead_line(current_line) || is_unreachable_line(current_line) || is_dead_store_line(current_line);
 
         if (!line_is_dead) {
             int line_had_content = line_has_content(line_buf);
